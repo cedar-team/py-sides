@@ -18,6 +18,7 @@ import patsy
 
 from variance_reduction import VarianceReduction
 from differential_treatment_effect import DifferentialTreatmentEffect as DTE
+from subgroup_eval_scores import SubgroupEvaluationComparisons as SEC
 
 from sklearn.metrics import recall_score, precision_score
 
@@ -41,7 +42,7 @@ class SIDES():
         score: The computed score
     """
 
-    def __init__(self, min_group_size=25, max_group_size=140, no_of_groups=3, max_depth=2, rel_improve=0.5, verbose=False, multiplicity='bonferroni', binning=False, response='y1'):
+    def __init__(self, min_group_size=25, max_group_size=140, no_of_groups=3, max_depth=2, rel_improve=0.5, verbose=False, multiplicity='bonferroni', binning=False, response='y'):
         """Initialize differential treatment effect"""
         self.verbose = verbose
         if self.verbose:
@@ -58,10 +59,10 @@ class SIDES():
 
         self.return_subgroups = []
 
-
         # Initialize dependent modules
         self.vr = VarianceReduction()
         self.dte = DTE()
+        self.sec = SEC()
 
     def get_best_groups(self, dataset, covariate_columns, parent=None):
         '''
@@ -72,6 +73,7 @@ class SIDES():
         self.w = []
         self.mse = []
         self.mean = []
+        self.meandiff = []
         self.pvalue = []
         self.x = []
         self.z = []
@@ -83,10 +85,14 @@ class SIDES():
         self.depth = 0
 
         if parent != None:
+            #Log if parent group exists
             logging.debug("Parent group exists")
 
-        # save old index
-        dataset['orgidx'] = dataset.index
+        if parent == None:
+            # save old index if no parent
+            dataset['orgidx'] = dataset.index
+
+
         dataset.reset_index(inplace=True)
 
         # loop through all covariates and find best split
@@ -106,6 +112,7 @@ class SIDES():
             msex = []
             sizex = []
             rankx = []
+            meandiffx = []
 
             # define temporary dataframe per split
             tempDF = pd.DataFrame()
@@ -131,14 +138,22 @@ class SIDES():
                      continue
 
                 # split subgroups mean
-                mean_left = self.dataset[response][left].mean()
-                mean_right = self.dataset[response][right].mean()
+                mean_left = dataset[self.response][left].mean()
+                mean_right = dataset[self.response][right].mean()
+
+                subgroup = [dataset[left],dataset[right]][grp_index]
+                parentgroup =[dataset[left],dataset[right]][1-grp_index]
 
                 # Remove all groups which have a mean treatment effect difference of more than -0.6
-                if([mean_left, mean_right][grp_index] - [mean_left, mean_right][1-grp_index] > -0.6):
+                _, meandiff = self.sec.compare("two", dataset, subgroup, parentgroup)
+                if(meandiff > -0.6):
                     continue
+                #add mean diff as comparison parameter
+                meandiffx.append(meandiff)
 
+                #add group size
                 sizex.append(grp_size_cond)
+
                 # add split value
                 splitx.append(val)
 
@@ -168,9 +183,6 @@ class SIDES():
                 # compute pvalue for chosen subgroup (two-tailed)
                 pvalue = [pvleft, pvright][grp_index]
                 pvaluex.append(pvalue)
-
-                #compute alternate score (similar to effect size)
-
 
                 if parent != None:
                     # relative improvement in treatment effect (TE) in child
@@ -216,29 +228,40 @@ class SIDES():
                 self.pvalue.append(pvaluex[idx])
                 self.effectsize.append(effectsizex[idx])
                 self.mean.append(meanx[idx])
+                self.meandiff.append(meandiffx[idx])
+
                 self.w.append(wx[idx])
                 self.splits.append(splitx[idx])
                 self.mse.append(msex[idx])
+        print "last mse and w"
+        print len(self.mse)
+        print len(self.w)
 
-        for group in np.argsort(self.w)[:self.no_of_groups]:
-            #self.return_subgroups.append({'w': self.w[group], "mse": self.mse[group], 'groups': self.subgroups[group], 'mean': self.mean[group], 'xsplit': self.x[group], 'groupsize': len(self.subgroups[group]), 'ztest': self.z[group], 'pvalue': self.pvalue[group], 'effectsize': self.effectsize[group], 'splitvalue': self.splits[group]})
-            self.best_subgroups.append({'w': self.w[group], "mse": self.mse[group], 'group': self.subgroups[group], 'mean': self.mean[group], 'xsplit': self.x[group], 'groupsize': len(self.subgroups[group]), 'ztest': self.z[group], 'pvalue': self.pvalue[group], 'effectsize': self.effectsize[group], 'splitvalue': self.splits[group]})
-
-        self.depth += 1
-        if (self.depth<=self.max_depth & len(self.subgroups)>0):
-            for subgroup in self.best_subgroups:
-                #print subgroup
-                #for group in np.argsort(self.w)[:self.no_of_groups]:
-                    #self.return_subgroups.append({'w': self.w[group], "mse": self.mse[group], 'groups': self.subgroups[group], 'mean': self.mean[group], 'xsplit': self.x[group], 'groupsize': len(self.subgroups[group]), 'ztest': self.z[group], 'pvalue': self.pvalue[group], 'effectsize': self.effectsize[group], 'splitvalue': self.splits[group]})
-                #subgroup = {'w': self.w[group], "mse": self.mse[group], 'groups': self.subgroups[group], 'mean': self.mean[group], 'xsplit': self.x[group], 'groupsize': len(self.subgroups[group]), 'ztest': self.z[group], 'pvalue': self.pvalue[group], 'effectsize': self.effectsize[group], 'splitvalue': self.splits[group]}
-                self.return_subgroups.append(subgroup)
-                print "return groups", self.return_subgroups
-                print "depth", self.depth
-                remove_x_index = covariate_columns.index(subgroup['xsplit'])
-                del covariate_columns[remove_x_index]
-                self.get_best_groups(dataset.iloc[subgroup['group']], covariate_columns, parent=subgroup)
+        if (self.depth < self.max_depth & len(self.best_subgroups)>0):
+            for group in np.argsort(self.w)[:self.no_of_groups]:
+                print "in for loop"
+                print group
+                #self.return_subgroups.append({'w': self.w[group], "mse": self.mse[group], 'groups': self.subgroups[group], 'mean': self.mean[group], 'xsplit': self.x[group], 'groupsize': len(self.subgroups[group]), 'ztest': self.z[group], 'pvalue': self.pvalue[group], 'effectsize': self.effectsize[group], 'splitvalue': self.splits[group]})
+                self.best_subgroups.append({'w': self.w[group], "mse": self.mse[group], 'group': self.subgroups[group], 'mean': self.mean[group], 'xsplit': self.x[group], 'groupsize': len(self.subgroups[group]), 'ztest': self.z[group], 'pvalue': self.pvalue[group], 'effectsize': self.effectsize[group], 'splitvalue': self.splits[group]})
+                print self.best_subgroups
+                self.depth += 1
+                if (self.depth < self.max_depth & len(self.best_subgroups)>0):
+                    for subgroup in self.best_subgroups:
+                        #print subgroup
+                        #for group in np.argsort(self.w)[:self.no_of_groups]:
+                            #self.return_subgroups.append({'w': self.w[group], "mse": self.mse[group], 'groups': self.subgroups[group], 'mean': self.mean[group], 'xsplit': self.x[group], 'groupsize': len(self.subgroups[group]), 'ztest': self.z[group], 'pvalue': self.pvalue[group], 'effectsize': self.effectsize[group], 'splitvalue': self.splits[group]})
+                        #subgroup = {'w': self.w[group], "mse": self.mse[group], 'groups': self.subgroups[group], 'mean': self.mean[group], 'xsplit': self.x[group], 'groupsize': len(self.subgroups[group]), 'ztest': self.z[group], 'pvalue': self.pvalue[group], 'effectsize': self.effectsize[group], 'splitvalue': self.splits[group]}
+                        self.return_subgroups.append(subgroup)
+                        print "return groups", self.return_subgroups
+                        print "depth", self.depth
+                        remove_x_index = covariate_columns.index(subgroup['xsplit'])
+                        del covariate_columns[remove_x_index]
+                        self.get_best_groups(dataset.iloc[subgroup['group']], covariate_columns, parent=subgroup)
         else:
-            print "best subgroups return", self.return_subgroups
+            if (self.depth==1):
+                print "depth 1"
+                self.return_subgroups = [{'w': self.w[group], "mse": self.mse[group], 'group': self.subgroups[group], 'mean': self.mean[group], 'xsplit': self.x[group], 'groupsize': len(self.subgroups[group]), 'ztest': self.z[group], 'pvalue': self.pvalue[group], 'effectsize': self.effectsize[group], 'splitvalue': self.splits[group]}]
+
             return self.return_subgroups
 
 if __name__ == "__main__":
@@ -246,7 +269,7 @@ if __name__ == "__main__":
 
     for i in range(1, 5):
         print "Dataset: ", i
-        df = pd.read_pickle('test_datasets/dataset_' + str(i) + '.df')
+        df = pd.read_pickle('dataset_' + str(i) + '.df')
         df = df.reset_index(drop=True)
 
         feature_cols = [x for x in df.columns[4:]]
